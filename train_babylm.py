@@ -38,11 +38,11 @@ HP = dict(
     dataset="BabyLM-community/BabyLM-2026-Strict-Small",
     vocab_size=8000,
     # model (the locked dynconv16 architecture)
-    d_model=192, d_ff=768, n_layers=3, n_heads=4,
+    d_model=384, d_ff=1536, n_layers=3, n_heads=4,
     conv_dilations=[1, 2, 4], conv_kernel=3, dyn_groups=16, match_m=5,
     max_position_embeddings=512,
     # optimisation
-    seq_len=256, batch_size=32, n_steps=4000,
+    seq_len=256, batch_size=32, n_steps=2500,
     lr=5e-4, lr_schedule="cosine", eta_min_frac=0.05,
     weight_decay=0.01, betas=[0.9, 0.95], grad_clip=1.0,
     warmup_steps=0, seed=42,
