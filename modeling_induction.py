@@ -15,8 +15,10 @@ primitives:
   3. SwiGLU FFN (per-token compute).
 
 The split is the whole idea: conv = local word-order, induction = long-range exact
-recall, FFN = computation. None is redundant. ~3.9M params, ~59 val ppl on BabyLM-2026
-Strict-Small (vs GPT-2 baseline / attention ~77).
+recall, FFN = computation. None is redundant. The released configuration is ~12.2M params
+(d_model=384, d_ff=1536, 3 layers); trained multi-epoch with the Muon optimiser it reaches
+~35 val ppl and BLiMP ~66 (full nyu-mll/blimp proxy) on BabyLM-2026 Strict-Small, matching a
+same-scale attention baseline while remaining attention-free (see train_babylm.py / README).
 
 Exposes three HF classes so the BabyLM eval pipeline can load it:
   InductionModel                    -> hidden states
@@ -47,8 +49,8 @@ class InductionConfig(PretrainedConfig):
     def __init__(
         self,
         vocab_size: int = 8000,
-        d_model: int = 192,
-        d_ff: int = 768,
+        d_model: int = 384,
+        d_ff: int = 1536,
         n_layers: int = 3,
         n_heads: int = 4,
         max_position_embeddings: int = 512,
@@ -58,8 +60,8 @@ class InductionConfig(PretrainedConfig):
         match_m: int = 5,
         num_labels: int = 2,
         pad_token_id: int = 0,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
+        bos_token_id: int = 2,
+        eos_token_id: int = 3,
         tie_word_embeddings: bool = True,
         **kwargs,
     ):
