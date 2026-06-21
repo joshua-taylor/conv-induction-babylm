@@ -16,13 +16,39 @@ Run on Kaggle AFTER train_babylm.py, with a write token:
 The repo MUST be public before you submit. Because the architecture is custom, anyone
 loading it (including the eval pipeline) must pass trust_remote_code=True — the
 modeling_induction.py file is uploaded with each revision so that works.
+
+NOTE: save_pretrained only writes the auto_map entry for the class it saved
+(AutoModelForCausalLM). The GLUE fine-tuning loads the model via AutoModel and reads
+config.hidden_size, so before uploading the final model we rewrite final-model/config.json
+to expose ALL auto classes + hidden_size. (Checkpoint branches are zero-shot CausalLM only,
+so they don't need this.)
 """
 
-import os, re, argparse
+import os, re, json, argparse
 from huggingface_hub import HfApi, create_repo, create_branch
 
 OUT = "/kaggle/working"
 CKPT_RE = re.compile(r"^chck_(\d+)M$")
+
+FULL_AUTO_MAP = {
+    "AutoConfig": "modeling_induction.InductionConfig",
+    "AutoModel": "modeling_induction.InductionModel",
+    "AutoModelForCausalLM": "modeling_induction.InductionForCausalLM",
+    "AutoModelForSequenceClassification": "modeling_induction.InductionForSequenceClassification",
+}
+
+
+def patch_final_config(final_dir):
+    """Ensure the final model exposes every auto class + hidden_size for the GLUE loader."""
+    cfg_path = os.path.join(final_dir, "config.json")
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    cfg.setdefault("auto_map", {})
+    cfg["auto_map"].update(FULL_AUTO_MAP)
+    cfg["hidden_size"] = cfg.get("hidden_size", cfg.get("d_model", 384))
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print("  patched final-model/config.json: auto_map (+AutoModel/SeqClf) + hidden_size")
 
 
 def main():
@@ -38,8 +64,17 @@ def main():
 
     # 1) final model (best-BLiMP checkpoint) -> main
     final = os.path.join(args.out, "final-model")
+    patch_final_config(final)                                   # <-- GLUE fix
     print(f"Uploading final model ({final}) -> main")
     api.upload_folder(folder_path=final, repo_id=args.repo_id, commit_message="final model (best-BLiMP)")
+
+    # 1b) model card -> main (if a README.md sits next to the script or in out/)
+    for cand in ("README.md", os.path.join(args.out, "README.md")):
+        if os.path.exists(cand):
+            print(f"Uploading model card ({cand}) -> main")
+            api.upload_file(path_or_fileobj=cand, path_in_repo="README.md",
+                            repo_id=args.repo_id, commit_message="model card")
+            break
 
     # 2) each milestone snapshot -> its own branch (learning-curve / --fast eval)
     if not args.skip_checkpoints:
