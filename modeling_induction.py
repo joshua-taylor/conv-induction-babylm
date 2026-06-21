@@ -21,12 +21,18 @@ recall, FFN = computation. None is redundant. The released configuration is ~12.
 same-scale attention baseline while remaining attention-free (see train_babylm.py / README).
 
 Exposes three HF classes so the BabyLM eval pipeline can load it:
-  InductionModel                    -> hidden states
+  InductionModel                    -> hidden states (AutoModel; used by GLUE fine-tuning)
   InductionForCausalLM              -> zero-shot (BLiMP/COMPS/entity-tracking, log-likelihoods)
-  InductionForSequenceClassification-> fine-tuning (GLUE)
+  InductionForSequenceClassification-> generic sequence classification head
 
 Causality is exact (next-token; the index only references earlier same-token positions).
-NOTE: assumes RIGHT padding (left padding would let pad tokens pollute the index).
+
+PADDING: positions are derived from `attention_mask` (cumsum), so the model is robust to
+*either* padding side. This matters because the BabyLM fine-tuning pipeline pads LEFT and
+pools the final position (`--padding_side left --take_final`); deriving positions from the
+mask keeps each real sequence on the trained position range (0..L-1) instead of pushing it
+onto never-trained high position rows. With a full (all-ones) mask this is identical to the
+previous absolute-position behaviour, so zero-shot results are unchanged.
 """
 
 import math
@@ -63,6 +69,7 @@ class InductionConfig(PretrainedConfig):
         bos_token_id: int = 2,
         eos_token_id: int = 3,
         tie_word_embeddings: bool = True,
+        hidden_size: int = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -75,6 +82,9 @@ class InductionConfig(PretrainedConfig):
         self.conv_kernel = conv_kernel
         self.dyn_groups = dyn_groups
         self.match_m = match_m
+        # Generic alias many HF tools (incl. the BabyLM GLUE classifier head) read off the
+        # config to size their head. Keep it in lockstep with d_model.
+        self.hidden_size = hidden_size if hidden_size is not None else d_model
         super().__init__(
             num_labels=num_labels,
             pad_token_id=pad_token_id,
@@ -244,12 +254,30 @@ class InductionModel(InductionPreTrainedModel):
 
     def forward(self, input_ids, attention_mask=None, **kwargs):
         B, T = input_ids.shape
-        Tp = min(T, self.config.max_position_embeddings)
+        dev = input_ids.device
+        maxp = self.config.max_position_embeddings
         cand = build_chain(prev_same_key(input_ids), self.config.match_m)
         x = self.embed_tokens(input_ids)
-        x = x + self.pos[:, :Tp] if T <= Tp else x + F.pad(self.pos, (0, 0, 0, T - Tp))[:, :T]
-        for layer in self.layers:
-            x = layer(x, cand)
+        # Position ids from the mask: each real sequence starts at position 0 regardless of
+        # padding side, so left-padded fine-tuning inputs stay on the trained position range.
+        # Full/None mask -> 0..T-1, identical to plain absolute positions (zero-shot unchanged).
+        if attention_mask is not None:
+            pos_ids = attention_mask.long().cumsum(-1).sub(1).clamp(min=0)
+        else:
+            pos_ids = torch.arange(T, device=dev).unsqueeze(0).expand(B, -1)
+        pos_ids = pos_ids.clamp(max=maxp - 1)
+        x = x + self.pos[0][pos_ids]                                   # (B,T,d)
+        # Zero pad positions so the causal conv reads zeros there (matching the unpadded
+        # case, whose pre-sequence window is zero-padded). Re-zero each layer to stop drift.
+        # This makes the model invariant to padding side; a full/None mask is a no-op.
+        if attention_mask is not None:
+            m = attention_mask.to(x.dtype).unsqueeze(-1)               # (B,T,1)
+            x = x * m
+            for layer in self.layers:
+                x = layer(x, cand) * m
+        else:
+            for layer in self.layers:
+                x = layer(x, cand)
         return BaseModelOutput(last_hidden_state=self.norm(x))
 
 
@@ -292,7 +320,8 @@ class InductionForCausalLM(InductionPreTrainedModel):
 
 
 # ======================================================================
-# Sequence-classification head (fine-tuning: GLUE)
+# Sequence-classification head (generic; the BabyLM GLUE pipeline uses its own
+# head on top of AutoModel, but this is provided for standard HF usage)
 # ======================================================================
 class InductionForSequenceClassification(InductionPreTrainedModel):
     def __init__(self, config: InductionConfig):
@@ -311,15 +340,19 @@ class InductionForSequenceClassification(InductionPreTrainedModel):
     def forward(self, input_ids, attention_mask=None, labels=None, **kwargs):
         hidden = self.model(input_ids, attention_mask=attention_mask).last_hidden_state
         logits = self.score(hidden)                                    # (B,T,num_labels)
-        # pool the last non-pad token (GPT-2-style), right padding assumed
+        # pool the last real token. With right padding -> last non-pad index;
+        # with left padding -> the final position. Mask-aware either way.
         if attention_mask is not None:
             lengths = attention_mask.long().sum(-1) - 1
+            left_padded = attention_mask[:, 0].sum() < attention_mask.size(0)  # heuristic
+            idx = torch.full((input_ids.size(0),), input_ids.size(1) - 1, device=input_ids.device) \
+                if bool((attention_mask[:, -1] == 1).all()) else lengths.clamp(min=0)
         elif self.config.pad_token_id is not None:
-            lengths = (input_ids != self.config.pad_token_id).long().sum(-1) - 1
+            idx = (input_ids != self.config.pad_token_id).long().sum(-1) - 1
         else:
-            lengths = torch.full((input_ids.size(0),), input_ids.size(1) - 1, device=input_ids.device)
-        lengths = lengths.clamp(min=0)
-        pooled = logits[torch.arange(input_ids.size(0), device=input_ids.device), lengths]
+            idx = torch.full((input_ids.size(0),), input_ids.size(1) - 1, device=input_ids.device)
+        idx = idx.clamp(min=0)
+        pooled = logits[torch.arange(input_ids.size(0), device=input_ids.device), idx]
         loss = None
         if labels is not None:
             if self.num_labels == 1:
