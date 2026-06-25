@@ -26,8 +26,8 @@ python exp_b2_components.py
 echo "=== B5: copy / kNN baseline (vs the learned model) ==="
 python exp_b5_copy_baseline.py
 
-echo "=== M1: edge causal-patching ==="
-for L in 0 1 2; do echo "-- layer $L --"; LAYER=$L python exp_m1_edge_patching.py; done
+echo "=== M1: edge causal-patching (sweeps all layers) ==="
+python exp_m1_edge_patching.py
 
 echo "=== M2: edge severing ==="
 python exp_m2_edge_severing.py

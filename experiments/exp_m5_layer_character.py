@@ -42,6 +42,7 @@ def run():
 
     print(f"\n{'layer':>5} {'mean_dist':>10} {'mass_entropy':>13} {'sink_mass':>10} {'tok-id(off0)':>13}")
     print("-" * 56)
+    rows = []
     for L in range(n_layers):
         dists, ents, sinks = [], [], []
         for bi in range(0, data.size(0), B):
@@ -55,7 +56,7 @@ def run():
             Bn, Tn, C = mass.shape
             ti = torch.arange(Tn, device=DEVICE)[None, :, None]
             dist = (ti - nxt).clamp(min=0).float()
-            w = mass * ok.float()                                   # candidate mass where valid
+            w = mass * ok.float()
             wsum = w.sum()
             if wsum > 0:
                 dists.append(float((w * dist).sum() / wsum))
@@ -63,13 +64,30 @@ def run():
                 ent = -(p * (p + 1e-9).log()).sum(-1) / math.log(max(C, 2))
                 ents.append(float(ent[ok.any(-1)].mean()))
             sinks.append(float(S[..., C, :].mean()))
-        # token-identity (off 0) probe on the copied value at this layer
         reps, toks = M3.collect_values(model, data, L, ablate=False)
         acc0, _ = M3.probe_accuracy(reps, toks, T, 0, cfg.vocab_size, DEVICE)
         md = sum(dists) / len(dists) if dists else float("nan")
         me = sum(ents) / len(ents) if ents else float("nan")
         sm = sum(sinks) / len(sinks)
+        rows.append((L, md, me, sm, acc0))
         print(f"{L:>5} {md:>10.2f} {me:>13.3f} {sm:>10.3f} {acc0:>13.3f}")
+
+    try:
+        import paper_style as ps; ps.apply()
+        import matplotlib.pyplot as plt
+        L = [r[0] for r in rows]
+        panels = [("mean look-back distance", 1, "tokens"),
+                  ("mass entropy (focus)", 2, "norm. entropy"),
+                  ("sink mass (abstention)", 3, "fraction"),
+                  ("token-identity of copied value", 4, "probe acc")]
+        fig, axes = plt.subplots(1, 4, figsize=(13, 3.3))
+        for ax, (title, idx, ylab) in zip(axes, panels):
+            ax.plot(L, [r[idx] for r in rows], "-o", color=ps.PRIMARY)
+            ax.set_title(title, fontsize=10.5); ax.set_xlabel("layer"); ax.set_ylabel(ylab)
+            ax.set_xticks(L)
+        ps.save(fig, "figs/m5_layer_character.png")
+    except Exception as e:
+        print(f"(figure skipped: {type(e).__name__}: {e})")
 
     if MC.SMOKE:
         print("\nSMOKE OK: per-layer edge statistics computed.")

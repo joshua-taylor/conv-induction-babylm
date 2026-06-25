@@ -84,13 +84,17 @@ def run():
             continue
         bidx = torch.arange(Bn, device=DEVICE)[keep]
         t_sel = (best[keep] // C); top_c = (best[keep] % C)
-        # control = lowest-mass *valid* candidate for the same (b,t), excluding top
-        mt = mass[bidx, t_sel].clone()                       # (n,C)
-        mt = mt.masked_fill(~ok[bidx, t_sel], float("inf"))
-        mt[torch.arange(bidx.numel()), top_c] = float("inf")
-        ctrl_c = mt.argmin(-1)                                # low-mass valid edge, or a no-op slot
         cont = (cand[bidx, t_sel, top_c] + 1).clamp(0, Tn - 1)
         y_star = x[bidx, cont]
+        # control = lowest-mass valid candidate whose continuation token != y* (specificity);
+        # falls back to a no-op slot if none qualifies
+        cont_pos = (cand[bidx, t_sel] + 1).clamp(0, Tn - 1)   # (n,C)
+        cont_tok = torch.gather(x[bidx], 1, cont_pos)         # (n,C) continuation tokens
+        mt = mass[bidx, t_sel].clone()
+        mt = mt.masked_fill(~ok[bidx, t_sel], float("inf"))
+        mt = mt.masked_fill(cont_tok == y_star[:, None], float("inf"))
+        mt[torch.arange(bidx.numel()), top_c] = float("inf")
+        ctrl_c = mt.argmin(-1)
 
         with torch.no_grad():
             with SeverEdges(model, bidx, t_sel, top_c):

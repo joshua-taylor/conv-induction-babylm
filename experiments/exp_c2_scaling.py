@@ -92,20 +92,23 @@ def main():
         for (step, words, vp, cs) in rows:
             print(f"{arm:<11}{words:>12,}{vp:>10.2f}{cs:>12.3f}")
 
-    # optional figure
+    # figure
     try:
-        import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+        import paper_style as ps; ps.apply()
+        import matplotlib.pyplot as plt
+        col = {"induction": ps.PRIMARY, "attention": ps.SECOND}
+        fig, ax = plt.subplots(1, 2, figsize=(11, 4.2))
         for arm, rows in curves.items():
             w = [r[1] for r in rows]
-            ax[0].plot(w, [r[2] for r in rows], "-o", label=arm)
-            ax[1].plot(w, [r[3] for r in rows], "-o", label=arm)
-        ax[0].set(title="val perplexity", xlabel="words seen", ylabel="ppl"); ax[0].set_xscale("log"); ax[0].legend()
-        ax[1].set(title="induction copy score", xlabel="words seen", ylabel="acc"); ax[1].set_xscale("log"); ax[1].legend()
-        os.makedirs("figs", exist_ok=True); fig.tight_layout(); fig.savefig("figs/c2_scaling.png", dpi=140)
-        print("\nsaved figs/c2_scaling.png")
+            ax[0].plot(w, [r[2] for r in rows], "-o", color=col.get(arm), label=arm)
+            ax[1].plot(w, [r[3] for r in rows], "-o", color=col.get(arm), label=arm)
+        ax[0].set_xscale("log"); ax[0].set_title("validation perplexity")
+        ax[0].set_xlabel("words seen"); ax[0].set_ylabel("perplexity"); ax[0].legend()
+        ax[1].set_xscale("log"); ax[1].set_title("induction copy score")
+        ax[1].set_xlabel("words seen"); ax[1].set_ylabel("accuracy"); ax[1].legend()
+        ps.save(fig, "figs/c2_scaling.png")
     except Exception as e:
-        print(f"(figure skipped: {type(e).__name__})")
+        print(f"(figure skipped: {type(e).__name__}: {e})")
 
     if SMOKE:
         assert all(0 <= r[3] <= 1 for rows in curves.values() for r in rows), "copy score out of range"
