@@ -230,15 +230,17 @@ def synthetic_induction_batch(B, T, vocab, device, seed=0, repeat_p=0.4):
 
 
 def tokenize_corpus(tok, texts, T, max_seqs=512, device="cpu"):
-    ids = []
+    """Pack the whole corpus into one token stream, then slice into T-length windows.
+    (Previously short documents were dropped, which starved the long-range analyses.)"""
+    stream = []
     for txt in texts:
         if not txt or not txt.strip():
             continue
-        enc = tok(txt, return_attention_mask=False)["input_ids"]
-        for i in range(0, len(enc) - 1, T):
-            chunk = enc[i:i + T]
-            if len(chunk) >= T // 2:
-                ids.append(chunk + [tok.pad_token_id or 0] * (T - len(chunk)))
-        if len(ids) >= max_seqs:
+        stream.extend(tok(txt, return_attention_mask=False)["input_ids"])
+        if len(stream) >= max_seqs * T:
             break
-    return torch.tensor(ids[:max_seqs], dtype=torch.long, device=device)
+    n = min(len(stream) // T, max_seqs)
+    if n == 0:
+        return torch.zeros(0, T, dtype=torch.long, device=device)
+    ids = [stream[i * T:(i + 1) * T] for i in range(n)]
+    return torch.tensor(ids, dtype=torch.long, device=device)

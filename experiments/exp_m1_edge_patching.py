@@ -28,6 +28,7 @@ MIN_DIST = int(os.environ.get("MIN_DIST", "6" if MC.SMOKE else "32"))
 T = 32 if MC.SMOKE else 256
 B = 8 if MC.SMOKE else 16
 N_BATCHES = 2 if MC.SMOKE else 80
+K_PER_SEQ = int(os.environ.get("K_PER_SEQ", "2" if MC.SMOKE else "8"))
 
 
 class _null:
@@ -42,6 +43,30 @@ def logits_at(model, x, capture=None, patch=None):
         return model(input_ids=x).logits
 
 
+def select_multi(mass, cand, ok, min_dist, t_min, k):
+    """Up to k strongest qualifying long-range edges per sequence (distinct query positions)."""
+    Bn, Tn, C = mass.shape; dev = mass.device
+    ti = torch.arange(Tn, device=dev)[None, :, None]
+    good = ok & ((ti - (cand + 1)) >= min_dist) & (ti >= t_min)
+    m = mass.masked_fill(~good, -1.0)
+    best_c = m.argmax(-1)                                    # (B,T)
+    best_m = m.gather(2, best_c[..., None]).squeeze(-1)      # (B,T)
+    bs, ts, cts = [], [], []
+    for b in range(Bn):
+        vt = (best_m[b] > 0).nonzero(as_tuple=True)[0]
+        if vt.numel() == 0:
+            continue
+        order = best_m[b, vt].argsort(descending=True)[:k]
+        for t in vt[order].tolist():
+            s = int(cand[b, t, int(best_c[b, t])])
+            bs.append(b); ts.append(t); cts.append(s + 1)
+    if not bs:
+        z = torch.zeros(0, dtype=torch.long, device=dev)
+        return z, z, z
+    return (torch.tensor(bs, device=dev), torch.tensor(ts, device=dev),
+            torch.tensor(cts, device=dev))
+
+
 def measure_layer(model, data, layer, T):
     rows = []
     for bi in range(0, data.size(0), B):
@@ -54,10 +79,10 @@ def measure_layer(model, data, layer, T):
         mixer = MC.get_layers(model)[layer].mixer
         with torch.no_grad():
             _, mass, ok, _ = MC.recompute_mixer_S(mixer, xin, cand)
-        sel = MC.select_top_edges(mass, cand, ok, MIN_DIST)
-        if sel["b"].numel() == 0:
+        sel_b, sel_t, sel_cont = select_multi(mass, cand, ok, MIN_DIST, t_min=8, k=K_PER_SEQ)
+        if sel_b.numel() == 0:
             continue
-        b, t, cont = sel["b"], sel["t"], sel["cont"].clamp(0, T - 1)
+        b, t, cont = sel_b, sel_t, sel_cont.clamp(0, T - 1)
         y = x[b, cont]
         ctrl = MC.distance_matched_control(x, b, t, cont, cand)
         repl = xin.reshape(-1, xin.size(-1)).mean(0)
@@ -89,17 +114,18 @@ def run():
         data = torch.cat([MC.synthetic_induction_batch(B, T, cfg.vocab_size, DEVICE, seed=i)
                           for i in range(N_BATCHES)], 0)
 
-    print(f"\n{'layer':>5} {'n':>5} {'Δlogp edge':>12} {'Δlogp ctrl':>12} {'edge-ctrl':>10} {'‖Δlogit‖ ratio':>15}")
-    print("-" * 64)
+    print(f"\n{'layer':>5} {'n':>5} {'Δlogp edge':>12} {'Δlogp ctrl':>12} {'edge-ctrl':>10} {'‖Δ‖edge':>9} {'‖Δ‖ctrl':>9}")
+    print("-" * 72)
     res = []
     for L in range(n_layers):
         r = measure_layer(model, data, L, T)
         if r.numel() == 0:
-            print(f"{L:>5}     0   (no qualifying edges)"); res.append((L, 0, 0, 0, 0, 0)); continue
-        de, dc, le, lk = r[:, 0].mean(), r[:, 1].mean(), r[:, 2].mean(), r[:, 3].mean()
-        ratio = float(le / lk.clamp(min=1e-6))
-        res.append((L, r.size(0), float(de), float(dc), float(r[:, 0].std()), ratio))
-        print(f"{L:>5} {r.size(0):>5} {de:>12.4f} {dc:>12.4f} {de-dc:>10.4f} {ratio:>14.1f}x")
+            print(f"{L:>5}     0   (no qualifying edges)"); res.append((L, 0, 0.0, 0.0, 0.0, 0.0, 0.0)); continue
+        de, dc = float(r[:, 0].mean()), float(r[:, 1].mean())
+        le, lk = float(r[:, 2].mean()), float(r[:, 3].mean())
+        res.append((L, r.size(0), de, dc, float(r[:, 0].std()), le, lk))
+        note = "" if lk > 1e-3 else "   (ctrl=0: no path downstream of this layer)"
+        print(f"{L:>5} {r.size(0):>5} {de:>12.4f} {dc:>12.4f} {de-dc:>10.4f} {le:>9.2f} {lk:>9.2f}{note}")
 
     try:
         import paper_style as ps; ps.apply()
@@ -122,7 +148,7 @@ def run():
     if MC.SMOKE:
         nonzero = [r for r in res if r[1] > 0]
         assert nonzero, "no edges found in smoke"
-        assert all(r[5] >= 1.0 for r in nonzero), "edge should shift the query at least as much as control"
+        assert all(r[5] >= r[6] - 1e-6 for r in nonzero), "edge should shift the query at least as much as control"
         print("\nSMOKE OK: per-layer edge-patching swept; edge shift >= control at every layer.")
 
 

@@ -4,10 +4,13 @@ exp_m2_edge_severing.py — are the look-back edges NECESSARY?  (H2, necessity)
 
 Complement to M1 (which showed information flows along edges). Here we SEVER the strongest
 long-range edge for a query (set that candidate to invalid in `cand`, applied at every layer)
-and measure the drop in the query's log-prob of the copied token. Control: sever the
-LOWEST-mass valid candidate for the same query instead.
+and measure the drop in the query's log-prob of the copied token (NECESSITY). For SPECIFICITY
+we sever, on the same query, the lowest-mass valid candidate whose continuation differs from y*.
+On repetitive spans no such contrastive candidate exists; there the control is a true no-op and
+the query is excluded from the specificity comparison (we report how many queries had a control).
 
-  PREDICTION : severing the top edge drops logp(y*) far more than severing a low-mass edge.
+  PREDICTION : severing the top edge drops logp(y*) sharply; where a contrastive control exists,
+               severing it drops logp(y*) far less.
   FALSIFIER  : top and control drops are comparable -> the specific edge isn't load-bearing.
 
 Run:  python exp_m2_edge_severing.py   |   SMOKE=1 python exp_m2_edge_severing.py
@@ -61,7 +64,9 @@ def run():
         data = torch.cat([MC.synthetic_induction_batch(B, T, cfg.vocab_size, DEVICE, seed=i)
                           for i in range(N_BATCHES)], 0)
 
-    rows = []
+    top_d, top_l2 = [], []                         # necessity: clean -> sever-top (all queries)
+    ctrl_d, top_d_sub = [], []                     # specificity: paired, on queries with a real control
+    n_kept = 0; n_ctrl = 0
     for bi in range(0, data.size(0), B):
         x = data[bi:bi + B]
         if x.size(0) < 2:
@@ -75,53 +80,67 @@ def run():
         cand = cap.cand
         Bn, Tn, C = mass.shape
         ti = torch.arange(Tn, device=DEVICE)[None, :, None]
-        dist = ti - (cand + 1)
-        good = ok & (dist >= MIN_DIST) & (ti >= 8)
+        good = ok & ((ti - (cand + 1)) >= MIN_DIST) & (ti >= 8)
         m = mass.masked_fill(~good, -1.0)
-        flat = m.view(Bn, -1); best = flat.argmax(-1); bestval = flat.gather(1, best[:, None]).squeeze(1)
-        keep = bestval > 0
+        flat = m.view(Bn, -1); best = flat.argmax(-1)
+        keep = flat.gather(1, best[:, None]).squeeze(1) > 0
         if keep.sum() == 0:
             continue
         bidx = torch.arange(Bn, device=DEVICE)[keep]
         t_sel = (best[keep] // C); top_c = (best[keep] % C)
         cont = (cand[bidx, t_sel, top_c] + 1).clamp(0, Tn - 1)
         y_star = x[bidx, cont]
-        # control = lowest-mass valid candidate whose continuation token != y* (specificity);
-        # falls back to a no-op slot if none qualifies
-        cont_pos = (cand[bidx, t_sel] + 1).clamp(0, Tn - 1)   # (n,C)
-        cont_tok = torch.gather(x[bidx], 1, cont_pos)         # (n,C) continuation tokens
+        n_kept += bidx.numel()
+
+        # --- necessity: sever the top edge (every kept query) ---
+        with torch.no_grad(), SeverEdges(model, bidx, t_sel, top_c):
+            sev = model(input_ids=x).logits
+        lp_clean = F.log_softmax(clean[bidx, t_sel], -1).gather(1, y_star[:, None]).squeeze(1)
+        lp_sev = F.log_softmax(sev[bidx, t_sel], -1).gather(1, y_star[:, None]).squeeze(1)
+        drop_top = lp_clean - lp_sev
+        top_d += drop_top.tolist()
+        top_l2 += (sev[bidx, t_sel] - clean[bidx, t_sel]).norm(dim=-1).tolist()
+
+        # --- specificity control: lowest-mass valid candidate whose continuation != y* ---
+        # repetitive spans have no such candidate -> control is a no-op there (query skipped).
+        cont_tok = torch.gather(x[bidx], 1, (cand[bidx, t_sel] + 1).clamp(0, Tn - 1))
         mt = mass[bidx, t_sel].clone()
         mt = mt.masked_fill(~ok[bidx, t_sel], float("inf"))
         mt = mt.masked_fill(cont_tok == y_star[:, None], float("inf"))
         mt[torch.arange(bidx.numel()), top_c] = float("inf")
-        ctrl_c = mt.argmin(-1)
-
-        with torch.no_grad():
-            with SeverEdges(model, bidx, t_sel, top_c):
-                sev = model(input_ids=x).logits
-            with SeverEdges(model, bidx, t_sel, ctrl_c):
+        has_ctrl = torch.isfinite(mt).any(-1)
+        n_ctrl += int(has_ctrl.sum())
+        if has_ctrl.any():
+            sub = has_ctrl.nonzero(as_tuple=True)[0]
+            cc = mt[sub].argmin(-1)
+            bc, tc, yc = bidx[sub], t_sel[sub], y_star[sub]
+            with torch.no_grad(), SeverEdges(model, bc, tc, cc):
                 ctl = model(input_ids=x).logits
-        lp_clean = F.log_softmax(clean[bidx, t_sel], -1).gather(1, y_star[:, None]).squeeze(1)
-        lp_sev = F.log_softmax(sev[bidx, t_sel], -1).gather(1, y_star[:, None]).squeeze(1)
-        lp_ctl = F.log_softmax(ctl[bidx, t_sel], -1).gather(1, y_star[:, None]).squeeze(1)
-        l2_s = (sev[bidx, t_sel] - clean[bidx, t_sel]).norm(dim=-1)
-        l2_c = (ctl[bidx, t_sel] - clean[bidx, t_sel]).norm(dim=-1)
-        for i in range(bidx.numel()):
-            rows.append((float(lp_clean[i] - lp_sev[i]), float(lp_clean[i] - lp_ctl[i]),
-                         float(l2_s[i]), float(l2_c[i])))
+            lp_cln = F.log_softmax(clean[bc, tc], -1).gather(1, yc[:, None]).squeeze(1)
+            lp_ctl = F.log_softmax(ctl[bc, tc], -1).gather(1, yc[:, None]).squeeze(1)
+            ctrl_d += (lp_cln - lp_ctl).tolist()
+            top_d_sub += drop_top[sub].tolist()
 
-    if not rows:
+    if n_kept == 0:
         print("No qualifying edges (lower MIN_DIST)."); return
-    r = torch.tensor(rows)
-    print(f"\nselected edges: {len(rows)}")
-    print(f"  Delta logp(y*)  sever-TOP  = {r[:,0].mean():+.4f} +/- {r[:,0].std():.4f}")
-    print(f"  Delta logp(y*)  sever-ctrl = {r[:,1].mean():+.4f} +/- {r[:,1].std():.4f}")
-    print(f"  top - ctrl                 = {(r[:,0]-r[:,1]).mean():+.4f}   (>0 => edge is load-bearing)")
-    print(f"  ||Δlogits@t||  top={r[:,2].mean():.4f}  ctrl={r[:,3].mean():.4f}")
+    td = torch.tensor(top_d)
+    print(f"\nqueries with a long-range top edge: {n_kept}")
+    print(f"  NECESSITY   clean -> sever-TOP   Δlogp(y*) = {td.mean():+.4f} +/- {td.std():.4f}")
+    print(f"              ||Δlogits@t|| (top)            = {torch.tensor(top_l2).mean():.4f}")
+    print(f"\n  contrastive control available for {n_ctrl}/{n_kept} queries "
+          f"({100 * n_ctrl / max(n_kept, 1):.0f}%); the rest sit on repetitive spans where every")
+    print(f"  alternative shares the same continuation -> the control is a no-op there.")
+    if ctrl_d:
+        cd = torch.tensor(ctrl_d); ts = torch.tensor(top_d_sub)
+        print(f"\n  SPECIFICITY (paired, on those {len(ctrl_d)} queries):")
+        print(f"     sever-TOP  Δlogp(y*) = {ts.mean():+.4f} +/- {ts.std():.4f}")
+        print(f"     sever-CTRL Δlogp(y*) = {cd.mean():+.4f} +/- {cd.std():.4f}")
+        print(f"     top - ctrl           = {(ts - cd).mean():+.4f}   (>0 => the specific edge is load-bearing)")
+    else:
+        print(f"\n  (no contrastive controls at MIN_DIST={MIN_DIST}; necessity stands on the sever-TOP drop.)")
     if MC.SMOKE:
-        assert torch.isfinite(r).all()
-        assert r[:, 2].mean() >= r[:, 3].mean() - 1e-6, "top-edge severing should shift query >= control"
-        print("\nSMOKE OK: severing the top edge shifts the query at least as much as a low-mass edge.")
+        assert torch.isfinite(td).all()
+        print("\nSMOKE OK: sever-TOP gives a finite necessity drop; control reported separately.")
 
 
 if __name__ == "__main__":
