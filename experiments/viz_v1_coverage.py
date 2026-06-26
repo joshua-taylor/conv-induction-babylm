@@ -39,7 +39,7 @@ FALLBACK = {
     "code": "def add(a, b):\n    return a + b\n\ndef add(a, b):\n    return a + b\n",
     "stories": "the little girl walked to the river . she saw a small boat . the boat was old .",
     "encyclopedic": "water is made of hydrogen and oxygen . hydrogen is light and oxygen is heavy .",
-    "dialogue": "are you coming ? yes i am coming . are you coming too ? no i am not coming .",
+    #"dialogue": "are you coming ? yes i am coming . are you coming too ? no i am not coming .",
 }
 
 
@@ -78,7 +78,7 @@ def get_genre_texts():
     g["code"] = fetch_code()
     g["stories"] = fetch_hf("roneneldan/TinyStories", None, "train", "text") or [FALLBACK["stories"]]
     g["encyclopedic"] = fetch_hf("wikitext", "wikitext-2-raw-v1", "train", "text") or [FALLBACK["encyclopedic"]]
-    g["dialogue"] = fetch_hf("daily_dialog", None, "train", "dialog") or [FALLBACK["dialogue"]]
+    #g["dialogue"] = fetch_hf("daily_dialog", None, "train", "dialog") or [FALLBACK["dialogue"]]
     return g
 
 
