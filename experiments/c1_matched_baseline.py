@@ -43,7 +43,7 @@ from modeling_induction import (
 SMOKE = bool(os.environ.get("SMOKE"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 REPO = os.environ.get("HF_MODEL_ID")
-SEEDS = [0] if SMOKE else [0, 1, 2]
+SEEDS = [0] if SMOKE else [0, 1]
 NEG = float("-inf")
 
 # Optional: set to a callable(model, tokenizer, device) -> float BLiMP score to get BLiMP
